@@ -152,6 +152,7 @@ object JdbcUtils {
   * Implementation of layer for communicating with Vertica JDBC
   */
 class VerticaJdbcLayer(cfg: JDBCConfig) extends JdbcLayerInterface {
+  private final val MAX_CONNECT_ATTEMPTS = 3
   private val logger = LogProvider.getLogger(classOf[VerticaJdbcLayer])
   private val thread = Thread.currentThread().getName + ": "
   private val prop = new util.Properties()
@@ -180,8 +181,11 @@ class VerticaJdbcLayer(cfg: JDBCConfig) extends JdbcLayerInterface {
   logger.info("Connecting to Vertica with URI: " + jdbcURI)
 
   private var lazyInitialized = false
-  private lazy val connection: ConnectorResult[Connection] = {
-    Try { DriverManager.getConnection(jdbcURI, prop) }
+  private var connection: ConnectorResult[Connection] = null
+  connect()
+
+  private def connect(): ConnectorResult[Connection] = {
+    connection = Try { DriverManager.getConnection(jdbcURI, prop) }
       .toEither.left.map(handleConnectionException)
       .flatMap(conn => {
         lazyInitialized = true
@@ -193,6 +197,7 @@ class VerticaJdbcLayer(cfg: JDBCConfig) extends JdbcLayerInterface {
           c
         }, handleConnectionException).left.map(_.context("Initial connection was not valid."))
       })
+    connection
   }
 
   private def createClientLabel: String = {
@@ -525,12 +530,19 @@ class VerticaJdbcLayer(cfg: JDBCConfig) extends JdbcLayerInterface {
   private def useConnection[T](
                                 connection: Connection,
                                 action: Connection => T,
-                                exceptionCatcher: Throwable => ConnectorError): ConnectorResult[T] = {
+                                exceptionCatcher: Throwable => ConnectorError,
+                                reconnect_attempts:Int = MAX_CONNECT_ATTEMPTS): ConnectorResult[T] = {
     try {
       if (connection.isValid(0)) {
         Right(action(connection))
       } else {
-        Left(ConnectionDownError())
+        if(reconnect_attempts>0){
+          logger.info(s"Connection is invalid. Attempting to reconnect. ${reconnect_attempts} left.")
+          connect()
+          this.connection.flatMap(conn => this.useConnection(connection,action,exceptionCatcher,reconnect_attempts-1))
+        } else{
+          Left(ConnectionDownError())
+        }
       }
     } catch {
       case e: Throwable => Left(exceptionCatcher(e))
